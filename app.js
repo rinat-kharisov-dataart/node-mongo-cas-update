@@ -10,8 +10,7 @@ const client = new MongoClient(uri);
 
 const DEFAULT_PAYMENT_ID = "payment123456";
 
-const FINAL_STATUSES = ["SUCCEED", "FAILED"]
-// NEW -> WAITING_FOR_SENDING -> SENT_TO_POOL -> SUCCEED | FAILED
+// NEW -> PENDING -> SENT -> SUCCEED | FAILED
 async function run() {
     try {
         // Connect the client to the server (optional starting in v4.7)
@@ -28,55 +27,72 @@ async function run() {
         assert(await payments.countDocuments() === 0)
 
         // initialization of object
-        await cas_upsert(payments, {
-            "tocoPaymentId": DEFAULT_PAYMENT_ID, //internal id
-            "gatewayPaymentId": uuidv4(), //external id given by gateway
-            "timeOfPayment": Date.now(), //moment of fiat's transaction completion
-            "userAccountId": "alice@toco", // user's wallet account name
-            "amount": 100, // amount of money charged from the user
-        },
+        await cas_status_upsert(payments, {
+                "tocoPaymentId": DEFAULT_PAYMENT_ID, //internal id
+                "userAccountId": "alice@toco", // user's wallet account name
+            },
+            [],
             "NEW"
         );
 
-        await cas_upsert(payments,
-            {},
-            "WAITING_FOR_SENDING"
+        // task to transfer received
+        await cas_status_upsert(payments, {
+                "tocoPaymentId": DEFAULT_PAYMENT_ID, //internal id
+                "gatewayPaymentId": uuidv4(), //external id given by gateway
+                "timeOfPayment": Date.now(), //moment of fiat's transaction completion
+                "amount": 100, // amount of money charged from the user
+            },
+            ["NEW"],
+            "PENDING"
         );
 
-        await cas_upsert(payments,
+        // extrinsic was sent
+        await cas_status_upsert(payments,
             {},
-            "SENT_TO_POOL"
+            ["NEW", "PENDING"],
+            "SENT"
         );
 
-        // await cas_upsert(payments,
-        //     {},
-        //     "SENT_TO_POOL"
-        // );
-        //
-        // await cas_upsert(payments,
-        //     {},
-        //     "SUCCEED"
-        // );
-        //
-        // await cas_upsert(payments,
-        //     {},
-        //     "FAILED"
-        // );
-        //
-        // await cas_upsert(payments,
-        //     {},
-        //     "NEW"
-        // );
+        // accidentally comsumed task one more time
+        await cas_status_upsert(payments, {
+                "tocoPaymentId": DEFAULT_PAYMENT_ID, //internal id
+                "gatewayPaymentId": uuidv4(), //external id given by gateway
+                "timeOfPayment": Date.now(), //moment of fiat's transaction completion
+                "amount": 100, // amount of money charged from the user
+            },
+            ["NEW"],
+            "PENDING"
+        );
+
+        // event was consumed from the blockchain
+        await cas_status_upsert(payments,
+            {},
+            ["NEW", "PENDING", "SENT"],
+            "SUCCEED"
+        );
+
+        await cas_status_upsert(payments,
+            {},
+            ["PENDING"],
+            ["SENT"]
+        );
+
+        await cas_status_upsert(payments,
+            {},
+            ["NEW", "PENDING", "SENT", "SUCCEED"],
+            "FAILED"
+        );
+
     } finally {
         // Ensures that the client will close when you finish/error
         await client.close();
     }
 }
 
-async function cas_upsert(collection, updateFilters, new_status) {
+async function cas_status_upsert(collection, updateFilters, expected_statuses, new_status) {
     let filterPaymentId = {"tocoPaymentId": DEFAULT_PAYMENT_ID};
     let now = Date.now();
-    await collection.updateOne(
+    let mutatedTransfer = await collection.findOneAndUpdate(
         filterPaymentId,
         [
             {
@@ -85,10 +101,11 @@ async function cas_upsert(collection, updateFilters, new_status) {
             {
                 $set: {
                     "status": {
-                        $cond: [ { $not: {$in: ["$status", FINAL_STATUSES]}}, new_status, "$status"]
+                        // set new status only if current status is not set or current status one of expected
+                        $cond: [{$or: [{$not: ["$status"]}, {$in: ["$status", expected_statuses]}]}, new_status, "$status"]
                     },
-                    // set `createdAt` only if it is insert operation
                     "createdAt": {
+                        // set `createdAt` only if it is insert operation
                         $ifNull: ["$createdAt", now]
                     },
                     "updatedAt": now
@@ -97,9 +114,11 @@ async function cas_upsert(collection, updateFilters, new_status) {
         ],
         {
             upsert: true,
+            returnDocument: "after"
         }
     )
-    console.log(`${JSON.stringify(await collection.findOne(filterPaymentId))}`)
+    console.log(`${JSON.stringify(mutatedTransfer.value)}`)
+    mutatedTransfer.value
 }
 
 run().catch(console.dir);
